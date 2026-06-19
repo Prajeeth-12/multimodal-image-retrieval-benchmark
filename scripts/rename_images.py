@@ -1,6 +1,8 @@
 from pathlib import Path
 
-for folder in Path(".").iterdir():
+DATASET_PATH = Path("../Restaurant_food_datasets")
+
+for folder in DATASET_PATH.iterdir():
     if not folder.is_dir():
         continue
 

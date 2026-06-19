@@ -1,9 +1,11 @@
 from pathlib import Path
 import csv
 
+DATASET_PATH = Path("../Restaurant_food_datasets")
+
 rows = []
 
-for folder in Path(".").iterdir():
+for folder in DATASET_PATH.iterdir():
     if not folder.is_dir():
         continue
 

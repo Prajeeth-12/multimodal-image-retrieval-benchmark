@@ -1,7 +1,7 @@
 from pathlib import Path
 from PIL import Image
 
-DATASET_PATH = r"."
+DATASET_PATH = Path("../Restaurant_food_datasets")
 
 valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -9,7 +9,7 @@ total = 0
 good = 0
 bad = 0
 print("STARTED")
-for img_path in Path(DATASET_PATH).rglob("*"):
+for img_path in DATASET_PATH.rglob("*"):
     if img_path.suffix.lower() not in valid_exts:
         continue
 

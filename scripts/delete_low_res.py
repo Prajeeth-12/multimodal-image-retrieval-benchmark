@@ -1,9 +1,11 @@
 from pathlib import Path
 from PIL import Image
 
+DATASET_PATH = Path("../Restaurant_food_datasets")
+
 deleted = 0
 
-for img_path in Path(".").rglob("*"):
+for img_path in DATASET_PATH.rglob("*"):
     if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
         continue
 
