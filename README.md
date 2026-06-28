@@ -6,42 +6,32 @@ This project benchmarks three retrieval approaches on a restaurant image corpus:
 2. Manual Human-Written Caption Embeddings
 3. VLM (GPT-generated) Caption Embeddings
 
-## Repository Architecture
-- `Restaurant_food_datasets/`: image corpus by restaurant
-- `metadata/`: metadata, captions, and benchmark queries
-- `embeddings/clip|manual|vlm/`: precomputed vector indexes
-- `scripts/`: data/embedding generation and evaluation scripts
-- `results/`: generated metrics, charts, and reports
+Each method is evaluated with three similarity metrics:
+- cosine
+- euclidean
+- dot product
 
-## Setup Instructions
-1. Install Python 3.10+.
-2. Install dependencies:
-   - `pip install numpy pandas matplotlib scikit-learn transformers sentence-transformers torch`
-3. Ensure model cache exists locally for offline-safe runs (`openai/clip-vit-base-patch32`, `all-MiniLM-L6-v2`).
+## Primary Deliverable: 3x3 Matrix Report
+Main output folder:
+- `results/3x3_matrix_report/`
+
+Inside this folder:
+- `matrices/matrix_top1_accuracy.csv`
+- `matrices/matrix_top3_accuracy.csv`
+- `matrices/matrix_top5_accuracy.csv`
+- `matrices/matrix_mrr.csv`
+- `diagrams/matrix_top1_accuracy_heatmap.png`
+- `diagrams/matrix_top3_accuracy_heatmap.png`
+- `diagrams/matrix_top5_accuracy_heatmap.png`
+- `diagrams/matrix_mrr_heatmap.png`
 
 ## Execution Instructions
-Run the full evaluation:
-
 ```bash
 python scripts/evaluate_methods.py
 ```
 
-Generated outputs:
-- `results/metrics.csv`
+## Additional Outputs
+- `results/metrics.csv` (all 9 method-metric combinations)
 - `results/per_query_results.csv`
-- `results/charts/*.png`
 - `results/final_report.md`
 - `results/final_report.html`
-- `results/executive_summary.md`
-
-## Benchmark Results
-| method | top1_accuracy | top3_accuracy | top5_accuracy | mrr | top1_accuracy_pct | top3_accuracy_pct | top5_accuracy_pct |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| CLIP | 0.32 | 0.6 | 0.8 | 0.5 | 32.0 | 60.0 | 80.0 |
-| Manual | 0.68 | 0.8 | 0.8 | 0.7419 | 68.0 | 80.0 | 80.0 |
-| VLM | 0.64 | 0.72 | 0.8 | 0.7062 | 64.0 | 72.0 | 80.0 |
-
-## Conclusions
-- Strongest method: **Manual**
-- Weakest method: **CLIP**
-- Detailed discussion, failure analysis, and future work are documented in `results/final_report.md`.

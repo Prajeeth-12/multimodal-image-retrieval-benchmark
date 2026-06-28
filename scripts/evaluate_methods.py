@@ -25,6 +25,9 @@ EMBEDDINGS_DIR = ROOT / "embeddings"
 RESULTS_DIR = ROOT / "results"
 CHARTS_DIR = RESULTS_DIR / "charts"
 
+SIMILARITY_METRICS = ["cosine", "euclidean", "dot_product"]
+METHOD_ORDER = ["CLIP", "Manual", "VLM"]
+
 
 STOPWORDS = {
     "a", "an", "the", "and", "or", "with", "of", "to", "in", "on", "for", "at", "by",
@@ -212,7 +215,37 @@ def rank_metrics(sorted_paths: List[str], relevant_set: Set[str]) -> Dict[str, f
     }
 
 
-def evaluate_all() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+def l2_normalize(arr: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(arr, axis=1, keepdims=True)
+    denom = np.maximum(denom, 1e-12)
+    return arr / denom
+
+
+def compute_scores(embeddings: np.ndarray, query_embedding: np.ndarray, similarity_metric: str) -> np.ndarray:
+    if similarity_metric == "dot_product":
+        return (embeddings @ query_embedding.T).reshape(-1)
+
+    if similarity_metric == "cosine":
+        emb_n = l2_normalize(embeddings)
+        q_n = l2_normalize(query_embedding)
+        return (emb_n @ q_n.T).reshape(-1)
+
+    if similarity_metric == "euclidean":
+        diff = embeddings - query_embedding
+        dists = np.linalg.norm(diff, axis=1)
+        return -dists
+
+    raise ValueError(f"Unsupported similarity metric: {similarity_metric}")
+
+
+def build_similarity_matrix(metrics_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    matrix = metrics_df.pivot(index="method", columns="similarity_metric", values=value_col)
+    matrix = matrix.reindex(index=METHOD_ORDER, columns=SIMILARITY_METRICS)
+    matrix = matrix.reset_index()
+    return matrix
+
+
+def evaluate_all() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object], pd.DataFrame, pd.DataFrame]:
     queries = pd.read_csv(METADATA_DIR / "benchmark_queries.csv")
     assets = load_retrieval_assets()
     image_text_df = build_image_text_table()
@@ -247,10 +280,9 @@ def evaluate_all() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
                 else:
                     raise ValueError(f"Unexpected CLIP output type: {type(clip_features)}")
         clip_query = clip_features.detach().cpu().numpy()
-        clip_query = clip_query / np.linalg.norm(clip_query, axis=1, keepdims=True)
 
         # Text-embedding query encoding for manual and VLM
-        txt_query = text_model.encode([query], normalize_embeddings=True)
+        txt_query = text_model.encode([query], normalize_embeddings=False)
 
         method_payload = {
             "CLIP": (assets["clip"][0], assets["clip"][1], clip_query),
@@ -259,36 +291,38 @@ def evaluate_all() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
         }
 
         for method_name, (emb, paths, q_emb) in method_payload.items():
-            scores = (emb @ q_emb.T).reshape(-1)
-            order = np.argsort(scores)[::-1]
-            sorted_paths = [paths[idx] for idx in order]
-            top5_paths = sorted_paths[:5]
-            top5_scores = [float(scores[idx]) for idx in order[:5]]
-            m = rank_metrics(sorted_paths, relevant_set)
+            for similarity_metric in SIMILARITY_METRICS:
+                scores = compute_scores(emb, q_emb, similarity_metric)
+                order = np.argsort(scores)[::-1]
+                sorted_paths = [paths[idx] for idx in order]
+                top5_paths = sorted_paths[:5]
+                top5_scores = [float(scores[idx]) for idx in order[:5]]
+                m = rank_metrics(sorted_paths, relevant_set)
 
-            per_query_rows.append(
-                {
-                    "query": query,
-                    "category": category,
-                    "method": method_name,
-                    "relevant_count": len(relevant_set),
-                    "first_relevant_rank": m["first_relevant_rank"],
-                    "top1": m["top1"],
-                    "top3": m["top3"],
-                    "top5": m["top5"],
-                    "mrr": m["mrr"],
-                    "top1_path": top5_paths[0] if top5_paths else "",
-                    "top1_score": top5_scores[0] if top5_scores else np.nan,
-                    "top5_paths": " | ".join(top5_paths),
-                    "silver_relevance_top_examples": " | ".join([f"{p}:{s:.2f}" for p, s in silver_top[:3]]),
-                }
-            )
+                per_query_rows.append(
+                    {
+                        "query": query,
+                        "category": category,
+                        "method": method_name,
+                        "similarity_metric": similarity_metric,
+                        "relevant_count": len(relevant_set),
+                        "first_relevant_rank": m["first_relevant_rank"],
+                        "top1": m["top1"],
+                        "top3": m["top3"],
+                        "top5": m["top5"],
+                        "mrr": m["mrr"],
+                        "top1_path": top5_paths[0] if top5_paths else "",
+                        "top1_score": top5_scores[0] if top5_scores else np.nan,
+                        "top5_paths": " | ".join(top5_paths),
+                        "silver_relevance_top_examples": " | ".join([f"{p}:{s:.2f}" for p, s in silver_top[:3]]),
+                    }
+                )
 
     per_query_df = pd.DataFrame(per_query_rows)
 
     metrics_df = (
         per_query_df
-        .groupby("method", as_index=False)[["top1", "top3", "top5", "mrr"]]
+        .groupby(["method", "similarity_metric"], as_index=False)[["top1", "top3", "top5", "mrr"]]
         .mean()
         .rename(columns={"top1": "top1_accuracy", "top3": "top3_accuracy", "top5": "top5_accuracy"})
     )
@@ -297,22 +331,32 @@ def evaluate_all() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     metrics_df["top5_accuracy_pct"] = (metrics_df["top5_accuracy"] * 100).round(2)
     metrics_df["mrr"] = metrics_df["mrr"].round(4)
 
-    return metrics_df, per_query_df, integrity
+    metrics_df["method"] = pd.Categorical(metrics_df["method"], METHOD_ORDER, ordered=True)
+    metrics_df["similarity_metric"] = pd.Categorical(metrics_df["similarity_metric"], SIMILARITY_METRICS, ordered=True)
+    metrics_df = metrics_df.sort_values(["method", "similarity_metric"]).reset_index(drop=True)
+
+    matrix_top1_df = build_similarity_matrix(metrics_df, "top1_accuracy")
+    matrix_mrr_df = build_similarity_matrix(metrics_df, "mrr")
+
+    return metrics_df, per_query_df, integrity, matrix_top1_df, matrix_mrr_df
 
 
 def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    methods = metrics_df["method"].tolist()
-    top1 = metrics_df["top1_accuracy"].tolist()
-    top3 = metrics_df["top3_accuracy"].tolist()
-    top5 = metrics_df["top5_accuracy"].tolist()
-    mrr = metrics_df["mrr"].tolist()
+    # Keep existing charts comparable by using dot-product slice.
+    chart_df = metrics_df[metrics_df["similarity_metric"] == "dot_product"].copy()
+
+    methods = chart_df["method"].tolist()
+    top1 = chart_df["top1_accuracy"].tolist()
+    top3 = chart_df["top3_accuracy"].tolist()
+    top5 = chart_df["top5_accuracy"].tolist()
+    mrr = chart_df["mrr"].tolist()
 
     # 1) Accuracy comparison bar chart (Top-1)
     plt.figure(figsize=(8, 5))
     plt.bar(methods, top1, color=["#1f77b4", "#2ca02c", "#ff7f0e"])
-    plt.title("Top-1 Accuracy by Retrieval Method")
+    plt.title("Top-1 Accuracy by Retrieval Method (Dot Product)")
     plt.ylabel("Accuracy")
     plt.ylim(0, 1)
     for i, v in enumerate(top1):
@@ -325,10 +369,10 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     plt.figure(figsize=(8, 5))
     ks = [1, 3, 5]
     for method in methods:
-        row = metrics_df[metrics_df["method"] == method].iloc[0]
+        row = chart_df[chart_df["method"] == method].iloc[0]
         vals = [row["top1_accuracy"], row["top3_accuracy"], row["top5_accuracy"]]
         plt.plot(ks, vals, marker="o", linewidth=2, label=method)
-    plt.title("Top-K Accuracy Comparison")
+    plt.title("Top-K Accuracy Comparison (Dot Product)")
     plt.xlabel("K")
     plt.ylabel("Accuracy")
     plt.xticks([1, 3, 5])
@@ -341,7 +385,7 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     # 3) MRR comparison chart
     plt.figure(figsize=(8, 5))
     plt.bar(methods, mrr, color=["#1f77b4", "#2ca02c", "#ff7f0e"])
-    plt.title("MRR by Retrieval Method")
+    plt.title("MRR by Retrieval Method (Dot Product)")
     plt.ylabel("MRR")
     plt.ylim(0, 1)
     for i, v in enumerate(mrr):
@@ -360,7 +404,7 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     plt.bar(x + 1.5 * w, mrr, width=w, label="MRR")
     plt.xticks(x, methods)
     plt.ylim(0, 1)
-    plt.title("Retrieval Performance Summary")
+    plt.title("Retrieval Performance Summary (Dot Product)")
     plt.ylabel("Score")
     plt.legend()
     plt.tight_layout()
@@ -373,7 +417,7 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     labels = [
         "Benchmark Queries\n(metadata/benchmark_queries.csv)",
         "Query Embedding\n(CLIP / MiniLM)",
-        "Similarity Search\n(dot-product over vectors)",
+        "Similarity Search\n(cosine / euclidean / dot)",
         "Metrics\n(Top-1/3/5, MRR)",
         "Analysis & Reports\n(csv + charts + docs)",
     ]
@@ -388,11 +432,12 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
     plt.savefig(CHARTS_DIR / "methodology_diagram.png", dpi=220)
     plt.close()
 
-    # Extra: category-wise Top-1 by method for analysis visuals
-    cat_table = per_query_df.groupby(["category", "method"], as_index=False)["top1"].mean()
+    # Extra: category-wise Top-1 by method for analysis visuals (dot-product slice)
+    cat_source = per_query_df[per_query_df["similarity_metric"] == "dot_product"]
+    cat_table = cat_source.groupby(["category", "method"], as_index=False)["top1"].mean()
     pivot = cat_table.pivot(index="category", columns="method", values="top1").fillna(0)
     pivot.plot(kind="bar", figsize=(9, 5))
-    plt.title("Top-1 Accuracy by Query Category")
+    plt.title("Top-1 Accuracy by Query Category (Dot Product)")
     plt.ylabel("Top-1 Accuracy")
     plt.ylim(0, 1)
     plt.tight_layout()
@@ -401,33 +446,41 @@ def make_charts(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> None:
 
 
 def build_analysis(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> Dict[str, object]:
-    best_method = metrics_df.sort_values("mrr", ascending=False).iloc[0]["method"]
-    weakest_method = metrics_df.sort_values("mrr", ascending=True).iloc[0]["method"]
+    analysis_metric = "dot_product"
+    metric_slice = metrics_df[metrics_df["similarity_metric"] == analysis_metric].copy()
+
+    best_method = metric_slice.sort_values("mrr", ascending=False).iloc[0]["method"]
+    weakest_method = metric_slice.sort_values("mrr", ascending=True).iloc[0]["method"]
+
+    per_query_metric = per_query_df[per_query_df["similarity_metric"] == analysis_metric].copy()
 
     failures = (
-        per_query_df[per_query_df["top1"] == 0]
+        per_query_metric[per_query_metric["top1"] == 0]
         .sort_values(["method", "first_relevant_rank"], ascending=[True, True])
         .head(12)
     )
 
     qual_success = (
-        per_query_df[per_query_df["top1"] == 1]
+        per_query_metric[per_query_metric["top1"] == 1]
         .sort_values(["method", "top1_score"], ascending=[True, False])
         .groupby("method")
         .head(2)
     )
 
     by_category = (
-        per_query_df
+        per_query_metric
         .groupby(["category", "method"], as_index=False)[["top1", "top3", "top5", "mrr"]]
         .mean()
     )
 
-    manual = metrics_df[metrics_df["method"] == "Manual"].iloc[0]
-    vlm = metrics_df[metrics_df["method"] == "VLM"].iloc[0]
-    clip = metrics_df[metrics_df["method"] == "CLIP"].iloc[0]
+    manual = metric_slice[metric_slice["method"] == "Manual"].iloc[0]
+    vlm = metric_slice[metric_slice["method"] == "VLM"].iloc[0]
+    clip = metric_slice[metric_slice["method"] == "CLIP"].iloc[0]
+
+    best_combo = metrics_df.sort_values("mrr", ascending=False).iloc[0]
 
     return {
+        "analysis_metric": analysis_metric,
         "best_method": best_method,
         "weakest_method": weakest_method,
         "failures": failures,
@@ -439,7 +492,12 @@ def build_analysis(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame) -> Dict
             "top5_delta": float(vlm["top5_accuracy"] - manual["top5_accuracy"]),
             "mrr_delta": float(vlm["mrr"] - manual["mrr"]),
         },
-        "clip_vs_best_mrr_gap": float(metrics_df["mrr"].max() - clip["mrr"]),
+        "clip_vs_best_mrr_gap": float(metric_slice["mrr"].max() - clip["mrr"]),
+        "best_method_metric_combo": {
+            "method": str(best_combo["method"]),
+            "similarity_metric": str(best_combo["similarity_metric"]),
+            "mrr": float(best_combo["mrr"]),
+        },
     }
 
 
@@ -454,11 +512,20 @@ def df_to_markdown(df: pd.DataFrame) -> str:
     return "\n".join([header, sep] + rows)
 
 
-def write_report_files(metrics_df: pd.DataFrame, per_query_df: pd.DataFrame, integrity: Dict[str, object], analysis: Dict[str, object]) -> None:
+def write_report_files(
+    metrics_df: pd.DataFrame,
+    per_query_df: pd.DataFrame,
+    integrity: Dict[str, object],
+    analysis: Dict[str, object],
+    matrix_top1_df: pd.DataFrame,
+    matrix_mrr_df: pd.DataFrame,
+) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
     metrics_table_md = df_to_markdown(metrics_df.round(4))
+    matrix_top1_md = df_to_markdown(matrix_top1_df.round(4))
+    matrix_mrr_md = df_to_markdown(matrix_mrr_df.round(4))
     category_table_md = df_to_markdown(analysis["by_category"].round(4))
     failure_table_md = df_to_markdown(
         analysis["failures"][["query", "category", "method", "first_relevant_rank", "top1_path"]]
@@ -487,88 +554,59 @@ The project objective is to compare multimodal and text-based retrieval quality 
 ## Methodology
 1. Load benchmark queries from `metadata/benchmark_queries.csv`.
 2. Retrieve against each embedding index independently.
-3. Build transparent silver relevance sets from existing captions and query-category constraints.
-4. Compute Top-1, Top-3, Top-5, and MRR per query and aggregate per method.
+3. Evaluate all three similarity metrics: cosine, euclidean, and dot product.
+4. Build transparent silver relevance sets from existing captions and query-category constraints.
+5. Compute Top-1, Top-3, Top-5, and MRR per query and aggregate per method-metric pair.
 
 ![Methodology Diagram](charts/methodology_diagram.png)
 *Figure: End-to-end evaluation pipeline.*
 
-## CLIP Baseline
-CLIP uses text-query to image-embedding similarity (`openai/clip-vit-base-patch32`) against `embeddings/clip/image_embeddings.npy`.
-
-## Manual Caption Baseline
-Manual human-written captions are encoded with `all-MiniLM-L6-v2` and searched over `embeddings/manual/manual_embeddings.npy`.
-
-## VLM Caption Baseline
-VLM-generated captions use the same text encoder and are searched over `embeddings/vlm/vlm_embeddings.npy`.
-
 ## Experimental Setup
 - Runtime mode: offline-safe model loading (`local_files_only=True`)
-- Similarity: normalized dot product
+- Similarities: cosine, euclidean, dot product
 - Top-K reported at K = 1, 3, 5
 - Query count: {per_query_df['query'].nunique()}
 
-## Evaluation Metrics
-- **Top-1 Accuracy**: first result is relevant
-- **Top-3 Accuracy**: any relevant result in top 3
-- **Top-5 Accuracy**: any relevant result in top 5
-- **MRR**: reciprocal of first relevant rank
-
-## Results
+## Results: Full Method x Similarity Table
 {metrics_table_md}
 
-![Top-1 Comparison](charts/accuracy_comparison_bar.png)
-*Figure: Top-1 accuracy by method.*
+## 3x3 Matrix Report (Method x Similarity)
+Top-1 Accuracy Matrix:
+{matrix_top1_md}
 
-![Top-K Comparison](charts/topk_comparison_chart.png)
-*Figure: Top-K curve (K=1,3,5) for each method.*
-
-![MRR Comparison](charts/mrr_comparison_chart.png)
-*Figure: MRR by method.*
-
-![Performance Summary](charts/retrieval_performance_summary_chart.png)
-*Figure: Combined Top-1/3/5 and MRR summary.*
+MRR Matrix:
+{matrix_mrr_md}
 
 ## Discussion
-- Strongest method (by MRR): **{analysis["best_method"]}**
-- Weakest method (by MRR): **{analysis["weakest_method"]}**
-- CLIP MRR gap vs best method: **{analysis["clip_vs_best_mrr_gap"]:.4f}**
-- Manual vs VLM deltas (VLM - Manual):
+- Best method (dot-product slice): **{analysis["best_method"]}**
+- Weakest method (dot-product slice): **{analysis["weakest_method"]}**
+- Best overall method-metric combo (by MRR): **{analysis["best_method_metric_combo"]["method"]} + {analysis["best_method_metric_combo"]["similarity_metric"]}** with **MRR={analysis["best_method_metric_combo"]["mrr"]:.4f}**
+- CLIP MRR gap vs best (dot-product slice): **{analysis["clip_vs_best_mrr_gap"]:.4f}**
+- Manual vs VLM deltas (VLM - Manual) for dot-product:
   - Top-1: **{analysis["manual_vs_vlm"]["top1_delta"]:+.4f}**
   - Top-3: **{analysis["manual_vs_vlm"]["top3_delta"]:+.4f}**
   - Top-5: **{analysis["manual_vs_vlm"]["top5_delta"]:+.4f}**
   - MRR: **{analysis["manual_vs_vlm"]["mrr_delta"]:+.4f}**
 
-Category-level behavior:
+Category-level behavior (dot-product):
 {category_table_md}
 
-## Failure Analysis
+## Failure Analysis (dot-product)
 Representative failure cases (top-1 miss):
 {failure_table_md}
 
 Qualitative strong examples (top-1 hit):
 {success_table_md}
 
-## Limitations
-1. Benchmark queries do not include explicit human-annotated relevance labels; this evaluation uses transparent silver relevance from existing captions and metadata.
-2. Dataset size is modest (103 images), so metric variance is relatively high query-to-query.
-3. Caption quality and consistency strongly influence text-embedding methods.
-
-## Future Work
-1. Add human-validated multi-label relevance judgments per query.
-2. Expand queries with harder compositional prompts and negatives.
-3. Evaluate additional encoders and rerankers (cross-encoder or late interaction).
-4. Add confidence intervals via bootstrap resampling.
-
 ## Conclusion
-The benchmark provides a complete, reproducible comparison across CLIP image retrieval, manual caption retrieval, and VLM-caption retrieval on the project dataset. Results, charts, and detailed per-query outputs are now generated and ready for submission and presentation.
+The benchmark now reports all 3 methods across all 3 similarity metrics (3x3), with reproducible per-query outputs and summary matrices.
 """
 
     (RESULTS_DIR / "final_report.md").write_text(report_md, encoding="utf-8")
 
     metrics_html = metrics_df.round(4).to_html(index=False, classes="table")
-    category_html = analysis["by_category"].round(4).to_html(index=False, classes="table")
-    failures_html = analysis["failures"][["query", "category", "method", "first_relevant_rank", "top1_path"]].to_html(index=False, classes="table")
+    matrix_top1_html = matrix_top1_df.round(4).to_html(index=False, classes="table")
+    matrix_mrr_html = matrix_mrr_df.round(4).to_html(index=False, classes="table")
 
     report_html = f"""<!doctype html>
 <html lang="en">
@@ -582,90 +620,24 @@ The benchmark provides a complete, reproducible comparison across CLIP image ret
     .table {{ border-collapse: collapse; width: 100%; margin: 12px 0 24px 0; }}
     .table th, .table td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
     .table th {{ background: #f3f4f6; }}
-    figure {{ margin: 18px 0 26px 0; }}
-    figcaption {{ font-size: 13px; color: #444; }}
-    .meta {{ background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; }}
   </style>
 </head>
 <body>
   <h1>Restaurant Image Retrieval Benchmark Report</h1>
-  <div class="meta">
-    <p><strong>Images:</strong> {integrity["dataset_image_count"]}</p>
-    <p><strong>Queries:</strong> {per_query_df['query'].nunique()}</p>
-    <p><strong>Methods:</strong> CLIP, Manual Caption Embeddings, VLM Caption Embeddings</p>
-  </div>
+  <p><strong>Images:</strong> {integrity["dataset_image_count"]} | <strong>Queries:</strong> {per_query_df['query'].nunique()} | <strong>Similarities:</strong> cosine, euclidean, dot product</p>
 
-  <h2>Abstract</h2>
-  <p>We benchmarked three retrieval approaches using repository-provided embeddings and benchmark queries, reporting Top-1/3/5 and MRR with complete reproducible outputs.</p>
-
-  <h2>Methodology Diagram</h2>
-  <figure>
-    <img src="charts/methodology_diagram.png" style="max-width: 100%;" />
-    <figcaption>Figure: Evaluation workflow from query file to metrics and reporting.</figcaption>
-  </figure>
-
-  <h2>Overall Metrics</h2>
+  <h2>Full Method x Similarity Metrics</h2>
   {metrics_html}
 
-  <h2>Visual Results</h2>
-  <figure>
-    <img src="charts/accuracy_comparison_bar.png" style="max-width: 100%;" />
-    <figcaption>Top-1 Accuracy comparison.</figcaption>
-  </figure>
-  <figure>
-    <img src="charts/topk_comparison_chart.png" style="max-width: 100%;" />
-    <figcaption>Top-K comparison (K=1,3,5).</figcaption>
-  </figure>
-  <figure>
-    <img src="charts/mrr_comparison_chart.png" style="max-width: 100%;" />
-    <figcaption>MRR comparison.</figcaption>
-  </figure>
-  <figure>
-    <img src="charts/retrieval_performance_summary_chart.png" style="max-width: 100%;" />
-    <figcaption>Retrieval performance summary chart.</figcaption>
-  </figure>
+  <h2>3x3 Matrix (Top-1 Accuracy)</h2>
+  {matrix_top1_html}
 
-  <h2>Category-wise Performance</h2>
-  {category_html}
-
-  <h2>Failure Cases</h2>
-  {failures_html}
-
-  <h2>Discussion</h2>
-  <p><strong>Strongest method:</strong> {analysis["best_method"]}</p>
-  <p><strong>Weakest method:</strong> {analysis["weakest_method"]}</p>
-  <p><strong>CLIP limitation summary:</strong> lower robustness than caption-based retrieval for text-heavy intent queries, particularly where fine-grained dish descriptors are needed.</p>
-
-  <h2>Conclusion</h2>
-  <p>The repository now contains a full evaluation phase with metrics CSVs, per-query results, publication charts, and research-style reporting artifacts.</p>
+  <h2>3x3 Matrix (MRR)</h2>
+  {matrix_mrr_html}
 </body>
 </html>
 """
     (RESULTS_DIR / "final_report.html").write_text(report_html, encoding="utf-8")
-
-    executive = f"""# Executive Summary
-
-## Objective
-Benchmark CLIP image retrieval, manual caption retrieval, and VLM-caption retrieval on the restaurant dataset.
-
-## What Was Completed
-1. Verified dataset/embedding integrity end-to-end.
-2. Implemented `scripts/evaluate_methods.py` for automated benchmarking.
-3. Computed Top-1, Top-3, Top-5, and MRR for all 25 queries and 3 methods.
-4. Generated `results/metrics.csv` and `results/per_query_results.csv`.
-5. Produced publication charts in `results/charts/`.
-6. Authored research report (`results/final_report.md`) and PDF-ready HTML report (`results/final_report.html`).
-
-## Key Findings
-- Best method by MRR: **{analysis["best_method"]}**
-- Weakest method by MRR: **{analysis["weakest_method"]}**
-- Manual vs VLM MRR delta (VLM - Manual): **{analysis["manual_vs_vlm"]["mrr_delta"]:+.4f}**
-- CLIP MRR gap vs best method: **{analysis["clip_vs_best_mrr_gap"]:.4f}**
-
-## Submission Readiness
-All required evaluation artifacts and analysis outputs are generated and stored under `results/`, ready for mentor review and presentation.
-"""
-    (RESULTS_DIR / "executive_summary.md").write_text(executive, encoding="utf-8")
 
     readme = f"""# Restaurant Image Retrieval Benchmark
 
@@ -675,41 +647,26 @@ This project benchmarks three retrieval approaches on a restaurant image corpus:
 2. Manual Human-Written Caption Embeddings
 3. VLM (GPT-generated) Caption Embeddings
 
-## Repository Architecture
-- `Restaurant_food_datasets/`: image corpus by restaurant
-- `metadata/`: metadata, captions, and benchmark queries
-- `embeddings/clip|manual|vlm/`: precomputed vector indexes
-- `scripts/`: data/embedding generation and evaluation scripts
-- `results/`: generated metrics, charts, and reports
-
-## Setup Instructions
-1. Install Python 3.10+.
-2. Install dependencies:
-   - `pip install numpy pandas matplotlib scikit-learn transformers sentence-transformers torch`
-3. Ensure model cache exists locally for offline-safe runs (`openai/clip-vit-base-patch32`, `all-MiniLM-L6-v2`).
+Each method is evaluated with three similarity metrics:
+- cosine
+- euclidean
+- dot product
 
 ## Execution Instructions
-Run the full evaluation:
-
 ```bash
 python scripts/evaluate_methods.py
 ```
 
 Generated outputs:
-- `results/metrics.csv`
+- `results/metrics.csv` (all 9 method-metric combinations)
+- `results/metrics_matrix_top1.csv` (3x3 matrix)
+- `results/metrics_matrix_mrr.csv` (3x3 matrix)
 - `results/per_query_results.csv`
-- `results/charts/*.png`
 - `results/final_report.md`
 - `results/final_report.html`
-- `results/executive_summary.md`
 
-## Benchmark Results
-{metrics_table_md}
-
-## Conclusions
-- Strongest method: **{analysis["best_method"]}**
-- Weakest method: **{analysis["weakest_method"]}**
-- Detailed discussion, failure analysis, and future work are documented in `results/final_report.md`.
+## 3x3 MRR Matrix
+{matrix_mrr_md}
 """
     (ROOT / "README.md").write_text(readme, encoding="utf-8")
 
@@ -718,18 +675,22 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    metrics_df, per_query_df, integrity = evaluate_all()
+    metrics_df, per_query_df, integrity, matrix_top1_df, matrix_mrr_df = evaluate_all()
     analysis = build_analysis(metrics_df, per_query_df)
 
     metrics_df.to_csv(RESULTS_DIR / "metrics.csv", index=False)
+    matrix_top1_df.to_csv(RESULTS_DIR / "metrics_matrix_top1.csv", index=False)
+    matrix_mrr_df.to_csv(RESULTS_DIR / "metrics_matrix_mrr.csv", index=False)
     per_query_df.to_csv(RESULTS_DIR / "per_query_results.csv", index=False)
     (RESULTS_DIR / "integrity_checks.json").write_text(json.dumps(integrity, indent=2), encoding="utf-8")
 
     make_charts(metrics_df, per_query_df)
-    write_report_files(metrics_df, per_query_df, integrity, analysis)
+    write_report_files(metrics_df, per_query_df, integrity, analysis, matrix_top1_df, matrix_mrr_df)
 
     print("Evaluation completed successfully.")
     print(f"Saved metrics: {RESULTS_DIR / 'metrics.csv'}")
+    print(f"Saved 3x3 Top-1 matrix: {RESULTS_DIR / 'metrics_matrix_top1.csv'}")
+    print(f"Saved 3x3 MRR matrix: {RESULTS_DIR / 'metrics_matrix_mrr.csv'}")
     print(f"Saved per-query results: {RESULTS_DIR / 'per_query_results.csv'}")
     print(f"Saved charts: {CHARTS_DIR}")
     print(f"Saved report: {RESULTS_DIR / 'final_report.md'}")
