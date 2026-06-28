@@ -1,0 +1,30 @@
+{
+  "dataset_image_count": 103,
+  "clip_embeddings_shape": [
+    103,
+    512
+  ],
+  "manual_embeddings_shape": [
+    103,
+    384
+  ],
+  "vlm_embeddings_shape": [
+    103,
+    384
+  ],
+  "clip_path_count": 103,
+  "manual_path_count": 103,
+  "vlm_path_count": 103,
+  "clip_dim": 512,
+  "manual_dim": 384,
+  "vlm_dim": 384,
+  "clip_vs_manual_paths_match": true,
+  "manual_vs_vlm_paths_match": true,
+  "missing_from_dataset_clip": [],
+  "missing_from_dataset_manual": [],
+  "missing_from_dataset_vlm": [],
+  "missing_from_clip_embeddings": [],
+  "missing_from_manual_embeddings": [],
+  "missing_from_vlm_embeddings": [],
+  "all_checks_passed": true
+}

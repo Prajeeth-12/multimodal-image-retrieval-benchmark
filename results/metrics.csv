@@ -1,0 +1,4 @@
+method,top1_accuracy,top3_accuracy,top5_accuracy,mrr,top1_accuracy_pct,top3_accuracy_pct,top5_accuracy_pct
+CLIP,0.32,0.6,0.8,0.5,32.0,60.0,80.0
+Manual,0.68,0.8,0.8,0.7419,68.0,80.0,80.0
+VLM,0.64,0.72,0.8,0.7062,64.0,72.0,80.0
