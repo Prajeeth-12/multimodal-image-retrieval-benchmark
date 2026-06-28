@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Non-final planning/report docs
+BATCH_WISE_ROADMAP.md
+results/*.md
